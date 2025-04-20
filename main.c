@@ -24,6 +24,17 @@
 // so if the key pressed has value equal to value of CTRL_KEY that is after taking end then it means the key is pressed with control key then we can map its functionality
 // we will have to code for ascii value of all control combo keys (26)
 
+/* ANSI escape sequences */
+#define ESC_HIDE_CURSOR "\x1b[?25l"
+#define ESC_SHOW_CURSOR "\x1b[?25h"
+#define ESC_CLEAR_SCREEN "\x1b[2J"
+#define ESC_POSITION_CURSOR "\x1b[H"
+#define ESC_CLEAR_LINE "\x1b[K"
+#define ESC_INVERT_COLORS "\x1b[7m"
+#define ESC_NORMAL_COLORS "\x1b[m"
+#define ESC_QUERY_CURSOR_POS "\x1b[6n"
+#define ESC_MOVE_CURSOR_TO_MAX "\x1b[999C\x1b[999B"
+
 enum editorKey
 {
     BACKSPACE = 127,
@@ -38,11 +49,12 @@ enum editorKey
     DELETE_KEY
 };
 
+
 /*** prototypes ***/
 
 void editorSetStatusMessage(const char *fmt, ...);
 void editorRefreshScreen();
-char *editorPrompt(char *prompt);
+char *editorPrompt(char *prompt, void (*callback)(char *, int));
 
 /*** data ***/
 
@@ -70,6 +82,7 @@ struct editorConfig
     char *filename;
     char statusmsg[80];
     time_t statusmsg_time;
+    
 };
 
 struct editorConfig E;
@@ -278,6 +291,25 @@ int editorRowCxToRx(erow *row, int cx)
     return rx;
 }
 
+int editorRowRxToCx(erow *row, int rx)
+{
+    int cur_rx = 0;
+    int cx;
+    for (cx = 0; cx < row->size; cx++)
+    {
+        if (row->chars[cx] == '\t')
+        {
+            cur_rx += 7 - (cur_rx % 8);
+        }
+        cur_rx++;
+        if (cur_rx > rx)
+        {
+            return cx;
+        }
+    }
+    return cx;
+}
+
 void editorUpdateRow(erow *row)
 {
     int tabs = 0;
@@ -442,6 +474,9 @@ void editorDelChar()
         E.cy--;
     }
 }
+void addToUndo(){
+
+}
 
 /*** file i/o ***/
 
@@ -502,7 +537,7 @@ void editorSave()
 {
     if (E.filename == NULL)
     {
-        E.filename = editorPrompt("Save as: %s (ESC to cancel)");
+        E.filename = editorPrompt("Save as: %s (ESC to cancel)", NULL);
         if (E.filename == NULL)
         {
             editorSetStatusMessage("Save aborted");
@@ -535,6 +570,49 @@ void editorSave()
     // write(fd,buf,len);
     // close(fd);
     // free(buf);
+}
+
+/*** search ***/
+
+void editorFindCallback(char *query, int key)
+{
+    if (key == '\r' || key == '\x1b')
+    {
+        return;
+    }
+    int i;
+    for (i = 0; i < E.numrows; i++)
+    {
+        erow *row = &E.row[i];
+        char *match = strstr(row->render, query);
+        if (match)
+        {
+            E.cy = i;
+            E.cx = editorRowRxToCx(row, match - row->render);
+            E.rowOffset = E.numrows;
+            break;
+        }
+    }
+}
+
+void editorFind()
+{
+    int saved_cx = E.cx;
+    int saved_cy = E.cy;
+    int saved_coloff = E.colOffset;
+    int saved_rowoff = E.rowOffset;
+    char *query = editorPrompt("Search: %s (ESC to cancel)", editorFindCallback);
+    if (query)
+    {
+        free(query);
+    }
+    else
+    {
+        E.cx = saved_cx;
+        E.cy = saved_cy;
+        E.colOffset = saved_coloff;
+        E.rowOffset = saved_rowoff;
+    }
 }
 
 /*** append buffer ***/
@@ -718,7 +796,7 @@ void editorSetStatusMessage(const char *fmt, ...)
 
 /*** input  ***/
 
-char *editorPrompt(char *prompt)
+char *editorPrompt(char *prompt, void (*callback)(char *, int))
 {
     size_t bufsize = 128;
     char *buf = malloc(bufsize);
@@ -737,6 +815,8 @@ char *editorPrompt(char *prompt)
         else if (c == '\x1b')
         {
             editorSetStatusMessage("");
+            if (callback)
+                callback(buf, c);
             free(buf);
             return NULL;
         }
@@ -745,6 +825,8 @@ char *editorPrompt(char *prompt)
             if (buflen != 0)
             {
                 editorSetStatusMessage("");
+                if (callback)
+                    callback(buf, c);
                 return buf;
             }
         }
@@ -758,6 +840,8 @@ char *editorPrompt(char *prompt)
             buf[buflen++] = c;
             buf[buflen] = '\0';
         }
+        if (callback)
+            callback(buf, c);
     }
 }
 
@@ -856,6 +940,15 @@ void editorProcessKeypress()
     case CTRL_KEY('s'):
         editorSave();
         break;
+    case CTRL_KEY('f'):
+        editorFind();
+        break;
+    case CTRL_KEY('z'):
+        // later
+        break;
+    case CTRL_KEY('y'):
+        // later
+        break;
     case HOME_KEY:
         E.cx = 0;
         break;
@@ -925,7 +1018,7 @@ int main(int argc, char *argv[])
     {
         editorOpen(argv[1]);
     }
-    editorSetStatusMessage("HELP: Ctrl-S = save | Ctrl-Q = quit");
+    editorSetStatusMessage("HELP: Ctrl-S = save | Ctrl-F = search | Ctrl-Q = quit");
     // char c;
     while (1)
     {
