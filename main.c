@@ -66,6 +66,11 @@ typedef struct erow
     char *render;
 } erow;
 
+typedef struct stack {
+    char arr[101];
+    int top;
+} stack;
+
 struct editorConfig
 {
     struct termios orig_termios;
@@ -79,6 +84,8 @@ struct editorConfig
     int colOffset;
     int changes;
     erow *row;
+    stack undoStack;
+    stack redoStack;
     char *filename;
     char statusmsg[80];
     time_t statusmsg_time;
@@ -394,6 +401,8 @@ void editorRowDelChar(erow *row, int at)
     {
         return;
     }
+    E.undoStack.arr[E.undoStack.top++] = row->chars[at];
+    // E.undoStack.top++;
     memmove(&row->chars[at], &row->chars[at + 1], row->size - at);
     row->size--;
     editorUpdateRow(row);
@@ -1008,6 +1017,8 @@ void initEditor()
     if (getWindowSize(&E.screenrows, &E.screencols) == -1)
         die("Window Size");
     E.screenrows -= 2;
+    E.undoStack.top = 0;
+    E.redoStack.top = 0;
 }
 
 int main(int argc, char *argv[])
