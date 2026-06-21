@@ -1,2 +1,7 @@
 .vscode
 test.txt
+main_c
+main_cpp
+main
+bench/*.txt
+bench/time_*.txt

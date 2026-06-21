@@ -16,13 +16,30 @@
 #include <sys/ioctl.h>
 #include <stdarg.h>
 #include <time.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
 
 /*** defines ***/
+
+#define UNDO_LIMIT 50
+#define BENCH_RENDER_ITERS 100
+#define BENCH_RENDER_WARMUP 3
 
 #define CTRL_KEY(k) ((k) & 0x1f)
 // After taking logical and with 00011111 first 3 bits are set to 0 and last bits are retained as a => 01100001 that is ASCII values (for alphabets for combo with control key) are till 122 => 01111010 that is only end 5 bits change from a to z so taking and with hex 1f gives the end 5 bits which signifies the value of key;
 // so if the key pressed has value equal to value of CTRL_KEY that is after taking end then it means the key is pressed with control key then we can map its functionality
 // we will have to code for ascii value of all control combo keys (26)
+
+/* ANSI escape sequences */
+#define ESC_HIDE_CURSOR "\x1b[?25l"
+#define ESC_SHOW_CURSOR "\x1b[?25h"
+#define ESC_CLEAR_SCREEN "\x1b[2J"
+#define ESC_POSITION_CURSOR "\x1b[H"
+#define ESC_CLEAR_LINE "\x1b[K"
+#define ESC_INVERT_COLORS "\x1b[7m"
+#define ESC_NORMAL_COLORS "\x1b[m"
+#define ESC_QUERY_CURSOR_POS "\x1b[6n"
+#define ESC_MOVE_CURSOR_TO_MAX "\x1b[999C\x1b[999B"
 
 enum editorKey
 {
@@ -38,11 +55,20 @@ enum editorKey
     DELETE_KEY
 };
 
+
 /*** prototypes ***/
+
+struct abuf;
 
 void editorSetStatusMessage(const char *fmt, ...);
 void editorRefreshScreen();
-char *editorPrompt(char *prompt);
+void editorRefreshScreenBuild(struct abuf *ab);
+char *editorPrompt(char *prompt, void (*callback)(char *, int));
+void editorPushUndo();
+void editorUndo();
+void editorRedo();
+void editorClearUndoStacks();
+void runBenchmark(char *filename);
 
 /*** data ***/
 
@@ -70,9 +96,91 @@ struct editorConfig
     char *filename;
     char statusmsg[80];
     time_t statusmsg_time;
+    
 };
 
 struct editorConfig E;
+
+typedef struct
+{
+    int cx;
+    int cy;
+    int numrows;
+    erow *row;
+} EditorSnapshot;
+
+struct BenchResult
+{
+    double open_ms;
+    long file_bytes;
+    int num_lines;
+    long peak_rss_kb;
+    double render_build_avg_ms;
+    double render_build_min_ms;
+    double render_build_max_ms;
+    double render_e2e_avg_ms;
+    double render_e2e_min_ms;
+    double render_e2e_max_ms;
+    double search_ms;
+    int terminal_rows;
+    int terminal_cols;
+};
+
+static EditorSnapshot undo_stack[UNDO_LIMIT];
+static EditorSnapshot redo_stack[UNDO_LIMIT];
+static int undo_len = 0;
+static int redo_len = 0;
+static int suppress_undo = 0;
+static int benchmark_mode = 0;
+
+/*** benchmark helpers ***/
+
+double benchNowMs()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
+}
+
+long benchPeakRssKb()
+{
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) != 0)
+        return -1;
+    return ru.ru_maxrss;
+}
+
+double benchSearchAll(const char *query)
+{
+    double start = benchNowMs();
+    int i;
+    for (i = 0; i < E.numrows; i++)
+    {
+        erow *row = &E.row[i];
+        if (row->render)
+            (void)strstr(row->render, query);
+    }
+    return benchNowMs() - start;
+}
+
+void benchPrintResult(struct BenchResult *r, const char *filename)
+{
+    fprintf(stderr, "=== Text Editor Benchmark ===\n");
+    fprintf(stderr, "file:              %s\n", filename);
+    fprintf(stderr, "file_bytes:        %ld (%.2f MB)\n", r->file_bytes,
+            r->file_bytes / (1024.0 * 1024.0));
+    fprintf(stderr, "num_lines:         %d\n", r->num_lines);
+    fprintf(stderr, "open_ms:           %.3f\n", r->open_ms);
+    fprintf(stderr, "peak_rss_kb:       %ld (%.2f MB)\n", r->peak_rss_kb,
+            r->peak_rss_kb / 1024.0);
+    fprintf(stderr, "terminal:          %dx%d\n", r->terminal_cols, r->terminal_rows);
+    fprintf(stderr, "render_build_ms:   avg=%.3f min=%.3f max=%.3f\n",
+            r->render_build_avg_ms, r->render_build_min_ms, r->render_build_max_ms);
+    fprintf(stderr, "render_e2e_ms:     avg=%.3f min=%.3f max=%.3f\n",
+            r->render_e2e_avg_ms, r->render_e2e_min_ms, r->render_e2e_max_ms);
+    fprintf(stderr, "search_ms:         %.3f\n", r->search_ms);
+    fprintf(stderr, "=============================\n");
+}
 
 /*** terminal ***/
 
@@ -278,6 +386,25 @@ int editorRowCxToRx(erow *row, int cx)
     return rx;
 }
 
+int editorRowRxToCx(erow *row, int rx)
+{
+    int cur_rx = 0;
+    int cx;
+    for (cx = 0; cx < row->size; cx++)
+    {
+        if (row->chars[cx] == '\t')
+        {
+            cur_rx += 7 - (cur_rx % 8);
+        }
+        cur_rx++;
+        if (cur_rx > rx)
+        {
+            return cx;
+        }
+    }
+    return cx;
+}
+
 void editorUpdateRow(erow *row)
 {
     int tabs = 0;
@@ -374,6 +501,150 @@ void editorFreeRow(erow *row)
     free(row->render);
 }
 
+/*** undo / redo ***/
+
+EditorSnapshot snapshotCopyState()
+{
+    EditorSnapshot snap;
+    int i;
+    snap.cx = E.cx;
+    snap.cy = E.cy;
+    snap.numrows = E.numrows;
+    snap.row = malloc(sizeof(erow) * (snap.numrows ? snap.numrows : 1));
+    for (i = 0; i < snap.numrows; i++)
+    {
+        snap.row[i].size = E.row[i].size;
+        snap.row[i].rsize = E.row[i].rsize;
+        snap.row[i].chars = malloc(E.row[i].size + 1);
+        memcpy(snap.row[i].chars, E.row[i].chars, E.row[i].size + 1);
+        if (E.row[i].render)
+        {
+            snap.row[i].render = malloc(E.row[i].rsize + 1);
+            memcpy(snap.row[i].render, E.row[i].render, E.row[i].rsize + 1);
+        }
+        else
+        {
+            snap.row[i].render = NULL;
+        }
+    }
+    return snap;
+}
+
+void snapshotFree(EditorSnapshot *snap)
+{
+    int i;
+    for (i = 0; i < snap->numrows; i++)
+    {
+        free(snap->row[i].chars);
+        free(snap->row[i].render);
+    }
+    free(snap->row);
+    snap->row = NULL;
+    snap->numrows = 0;
+}
+
+void editorFreeAllRows()
+{
+    int i;
+    for (i = 0; i < E.numrows; i++)
+        editorFreeRow(&E.row[i]);
+    free(E.row);
+    E.row = NULL;
+    E.numrows = 0;
+}
+
+void editorClearUndoStacks()
+{
+    int i;
+    for (i = 0; i < undo_len; i++)
+        snapshotFree(&undo_stack[i]);
+    for (i = 0; i < redo_len; i++)
+        snapshotFree(&redo_stack[i]);
+    undo_len = 0;
+    redo_len = 0;
+}
+
+void editorPushUndo()
+{
+    int i;
+    if (suppress_undo)
+        return;
+    if (undo_len == UNDO_LIMIT)
+    {
+        snapshotFree(&undo_stack[0]);
+        memmove(&undo_stack[0], &undo_stack[1],
+                sizeof(EditorSnapshot) * (UNDO_LIMIT - 1));
+        undo_len--;
+    }
+    undo_stack[undo_len++] = snapshotCopyState();
+    for (i = 0; i < redo_len; i++)
+        snapshotFree(&redo_stack[i]);
+    redo_len = 0;
+}
+
+void editorRestoreSnapshot(EditorSnapshot *snap)
+{
+    int i;
+    suppress_undo = 1;
+    editorFreeAllRows();
+    E.numrows = snap->numrows;
+    E.row = malloc(sizeof(erow) * (E.numrows ? E.numrows : 1));
+    for (i = 0; i < E.numrows; i++)
+    {
+        E.row[i].size = snap->row[i].size;
+        E.row[i].rsize = snap->row[i].rsize;
+        E.row[i].chars = malloc(snap->row[i].size + 1);
+        memcpy(E.row[i].chars, snap->row[i].chars, snap->row[i].size + 1);
+        if (snap->row[i].render)
+        {
+            E.row[i].render = malloc(snap->row[i].rsize + 1);
+            memcpy(E.row[i].render, snap->row[i].render, snap->row[i].rsize + 1);
+        }
+        else
+        {
+            E.row[i].render = NULL;
+        }
+    }
+    E.cx = snap->cx;
+    E.cy = snap->cy;
+    E.changes = 1;
+    suppress_undo = 0;
+}
+
+void editorUndo()
+{
+    if (undo_len == 0)
+        return;
+    if (redo_len == UNDO_LIMIT)
+    {
+        snapshotFree(&redo_stack[0]);
+        memmove(&redo_stack[0], &redo_stack[1],
+                sizeof(EditorSnapshot) * (UNDO_LIMIT - 1));
+        redo_len--;
+    }
+    redo_stack[redo_len++] = snapshotCopyState();
+    EditorSnapshot snap = undo_stack[--undo_len];
+    editorRestoreSnapshot(&snap);
+    snapshotFree(&snap);
+}
+
+void editorRedo()
+{
+    if (redo_len == 0)
+        return;
+    if (undo_len == UNDO_LIMIT)
+    {
+        snapshotFree(&undo_stack[0]);
+        memmove(&undo_stack[0], &undo_stack[1],
+                sizeof(EditorSnapshot) * (UNDO_LIMIT - 1));
+        undo_len--;
+    }
+    undo_stack[undo_len++] = snapshotCopyState();
+    EditorSnapshot snap = redo_stack[--redo_len];
+    editorRestoreSnapshot(&snap);
+    snapshotFree(&snap);
+}
+
 void editorDelRow(int at)
 {
     if (at < 0 || at >= E.numrows)
@@ -389,6 +660,7 @@ void editorDelRow(int at)
 
 void editorInsertChar(int c)
 {
+    editorPushUndo();
     if (E.cy == E.numrows)
     {
         editorInsertRow(E.numrows, "", 0);
@@ -399,6 +671,7 @@ void editorInsertChar(int c)
 
 void editorInsertNewline()
 {
+    editorPushUndo();
     if (E.cx == 0)
     {
         editorInsertRow(E.cy, "", 0);
@@ -426,6 +699,8 @@ void editorDelChar()
     {
         return;
     }
+
+    editorPushUndo();
 
     erow *row = &E.row[E.cy];
 
@@ -468,6 +743,7 @@ char *editorRowsToString(int *buflen)
 
 void editorOpen(char *filename)
 {
+    editorClearUndoStacks();
     free(E.filename);
     E.filename = strdup(filename);
     FILE *fp = fopen(filename, "r");
@@ -502,7 +778,7 @@ void editorSave()
 {
     if (E.filename == NULL)
     {
-        E.filename = editorPrompt("Save as: %s (ESC to cancel)");
+        E.filename = editorPrompt("Save as: %s (ESC to cancel)", NULL);
         if (E.filename == NULL)
         {
             editorSetStatusMessage("Save aborted");
@@ -535,6 +811,49 @@ void editorSave()
     // write(fd,buf,len);
     // close(fd);
     // free(buf);
+}
+
+/*** search ***/
+
+void editorFindCallback(char *query, int key)
+{
+    if (key == '\r' || key == '\x1b')
+    {
+        return;
+    }
+    int i;
+    for (i = 0; i < E.numrows; i++)
+    {
+        erow *row = &E.row[i];
+        char *match = strstr(row->render, query);
+        if (match)
+        {
+            E.cy = i;
+            E.cx = editorRowRxToCx(row, match - row->render);
+            E.rowOffset = E.numrows;
+            break;
+        }
+    }
+}
+
+void editorFind()
+{
+    int saved_cx = E.cx;
+    int saved_cy = E.cy;
+    int saved_coloff = E.colOffset;
+    int saved_rowoff = E.rowOffset;
+    char *query = editorPrompt("Search: %s (ESC to cancel)", editorFindCallback);
+    if (query)
+    {
+        free(query);
+    }
+    else
+    {
+        E.cx = saved_cx;
+        E.cy = saved_cy;
+        E.colOffset = saved_coloff;
+        E.rowOffset = saved_rowoff;
+    }
 }
 
 /*** append buffer ***/
@@ -683,26 +1002,26 @@ void editorDrawMessageBar(struct abuf *ab)
     }
 }
 
-void editorRefreshScreen()
+void editorRefreshScreenBuild(struct abuf *ab)
 {
     editorScroll();
-    struct abuf ab = ABUF_INIT;
 
-    abAppend(&ab, "\x1b[?25l", 6);
-    // write(STDOUT_FILENO, "\x1b[2J", 4);
-    // abAppend(&ab, "\x1b[2J", 4); cleared entire screen at once
-    // write(STDOUT_FILENO, "\x1b[H", 3);
-    abAppend(&ab, "\x1b[H", 3);
-    editorDrawRows(&ab);
-    editorDrawStatusBar(&ab);
-    editorDrawMessageBar(&ab);
+    abAppend(ab, "\x1b[?25l", 6);
+    abAppend(ab, "\x1b[H", 3);
+    editorDrawRows(ab);
+    editorDrawStatusBar(ab);
+    editorDrawMessageBar(ab);
 
     char buf[32];
     snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.cy - E.rowOffset + 1, E.rx - E.colOffset + 1);
-    abAppend(&ab, buf, strlen(buf));
-    // write(STDOUT_FILENO, "\x1b[H", 3);
-    // abAppend(&ab, "\x1b[H", 3);
-    abAppend(&ab, "\x1b[?25h", 6);
+    abAppend(ab, buf, strlen(buf));
+    abAppend(ab, "\x1b[?25h", 6);
+}
+
+void editorRefreshScreen()
+{
+    struct abuf ab = ABUF_INIT;
+    editorRefreshScreenBuild(&ab);
     write(STDOUT_FILENO, ab.b, ab.len);
     abFree(&ab);
 }
@@ -718,7 +1037,7 @@ void editorSetStatusMessage(const char *fmt, ...)
 
 /*** input  ***/
 
-char *editorPrompt(char *prompt)
+char *editorPrompt(char *prompt, void (*callback)(char *, int))
 {
     size_t bufsize = 128;
     char *buf = malloc(bufsize);
@@ -737,6 +1056,8 @@ char *editorPrompt(char *prompt)
         else if (c == '\x1b')
         {
             editorSetStatusMessage("");
+            if (callback)
+                callback(buf, c);
             free(buf);
             return NULL;
         }
@@ -745,6 +1066,8 @@ char *editorPrompt(char *prompt)
             if (buflen != 0)
             {
                 editorSetStatusMessage("");
+                if (callback)
+                    callback(buf, c);
                 return buf;
             }
         }
@@ -758,6 +1081,8 @@ char *editorPrompt(char *prompt)
             buf[buflen++] = c;
             buf[buflen] = '\0';
         }
+        if (callback)
+            callback(buf, c);
     }
 }
 
@@ -856,6 +1181,15 @@ void editorProcessKeypress()
     case CTRL_KEY('s'):
         editorSave();
         break;
+    case CTRL_KEY('f'):
+        editorFind();
+        break;
+    case CTRL_KEY('z'):
+        editorUndo();
+        break;
+    case CTRL_KEY('y'):
+        editorRedo();
+        break;
     case HOME_KEY:
         E.cx = 0;
         break;
@@ -912,20 +1246,124 @@ void initEditor()
     E.statusmsg[0] = '\0';
     E.statusmsg_time = 0;
     E.changes = 0;
-    if (getWindowSize(&E.screenrows, &E.screencols) == -1)
+    if (benchmark_mode || !isatty(STDOUT_FILENO))
+    {
+        E.screenrows = 24;
+        E.screencols = 80;
+    }
+    else if (getWindowSize(&E.screenrows, &E.screencols) == -1)
         die("Window Size");
     E.screenrows -= 2;
 }
 
+static void benchAccumulate(double *avg, double *min, double *max, double val, int *count)
+{
+    if (*count == 0)
+    {
+        *min = val;
+        *max = val;
+        *avg = val;
+    }
+    else
+    {
+        if (val < *min)
+            *min = val;
+        if (val > *max)
+            *max = val;
+        *avg += val;
+    }
+    (*count)++;
+}
+
+void runBenchmark(char *filename)
+{
+    struct stat st;
+    if (stat(filename, &st) != 0)
+        die("stat");
+
+    struct BenchResult result = {0};
+    result.file_bytes = st.st_size;
+
+    double start = benchNowMs();
+    editorOpen(filename);
+    result.open_ms = benchNowMs() - start;
+    result.num_lines = E.numrows;
+    result.peak_rss_kb = benchPeakRssKb();
+    result.terminal_rows = E.screenrows;
+    result.terminal_cols = E.screencols;
+
+    int null_fd = open("/dev/null", O_WRONLY);
+    if (null_fd == -1)
+        die("open /dev/null");
+    int saved_stdout = dup(STDOUT_FILENO);
+    if (saved_stdout == -1)
+        die("dup stdout");
+    if (dup2(null_fd, STDOUT_FILENO) == -1)
+        die("dup2 /dev/null");
+
+    double build_avg = 0, build_min = 0, build_max = 0;
+    double e2e_avg = 0, e2e_min = 0, e2e_max = 0;
+    int build_count = 0;
+    int e2e_count = 0;
+    int i;
+
+    for (i = 0; i < BENCH_RENDER_ITERS; i++)
+    {
+        struct abuf ab = ABUF_INIT;
+        double t0 = benchNowMs();
+        editorRefreshScreenBuild(&ab);
+        double build_ms = benchNowMs() - t0;
+        abFree(&ab);
+
+        double t1 = benchNowMs();
+        editorRefreshScreen();
+        double e2e_ms = benchNowMs() - t1;
+
+        if (i >= BENCH_RENDER_WARMUP)
+        {
+            benchAccumulate(&build_avg, &build_min, &build_max, build_ms, &build_count);
+            benchAccumulate(&e2e_avg, &e2e_min, &e2e_max, e2e_ms, &e2e_count);
+        }
+    }
+
+    if (dup2(saved_stdout, STDOUT_FILENO) == -1)
+        die("restore stdout");
+    close(saved_stdout);
+    close(null_fd);
+
+    if (build_count > 0)
+        build_avg /= build_count;
+    if (e2e_count > 0)
+        e2e_avg /= e2e_count;
+
+    result.render_build_avg_ms = build_avg;
+    result.render_build_min_ms = build_min;
+    result.render_build_max_ms = build_max;
+    result.render_e2e_avg_ms = e2e_avg;
+    result.render_e2e_min_ms = e2e_min;
+    result.render_e2e_max_ms = e2e_max;
+    result.search_ms = benchSearchAll("aaaa");
+
+    benchPrintResult(&result, filename);
+}
+
 int main(int argc, char *argv[])
 {
+    if (argc >= 3 && strcmp(argv[1], "--benchmark") == 0)
+    {
+        benchmark_mode = 1;
+        initEditor();
+        runBenchmark(argv[2]);
+        return 0;
+    }
+
     enableRawMode();
     initEditor();
     if (argc >= 2)
     {
         editorOpen(argv[1]);
     }
-    editorSetStatusMessage("HELP: Ctrl-S = save | Ctrl-Q = quit");
+    editorSetStatusMessage("HELP: Ctrl-S = save | Ctrl-F = search | Ctrl-Z = undo | Ctrl-Y = redo | Ctrl-Q = quit");
     // char c;
     while (1)
     {
