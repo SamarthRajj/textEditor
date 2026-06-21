@@ -5,3 +5,12 @@ main_cpp
 main
 bench/*.txt
 bench/time_*.txt
+
+# Binaries (already partially covered)
+samarth
+
+# Scratch / test files
+sam.txt
+samarth.txt
+a.cpp
+main.cpp
